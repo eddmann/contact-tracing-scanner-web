@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Contact Tracing Scanner using Web Bluetooth</title>
+
+    <link rel="stylesheet" href="https://fonts.xz.style/serve/inter.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@exampledev/new.css@1.1.2/new.min.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@10.2.1/build/styles/zenburn.min.css" />
+    <style>
+      body { max-width: 900px; }
+      #js-scanner button { margin-bottom: 20px; }
+      #js-browser-not-supported { display: none; }
+    </style>
+
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+    <script src="https://unpkg.com/react@16/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@16/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@10.2.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>Contact Tracing Scanner</h1>
+    </header>
+
+    <blockquote id="js-browser-not-supported">
+      This demo requires the <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Bluetooth_API" target="_blank">Web Bluetooth API</a>, which your browser <strong>does not</strong> seem to <a href="https://caniuse.com/web-bluetooth" target="_blank">support</a>.
+    </blockquote>
+    <script>if (navigator.bluetooth === undefined) document.getElementById("js-browser-not-supported").style.display = "block";</script>
+
+    <p>
+      <strong>How to use:</strong> Click the <em>Start Scan</em> button in a browser that supports the Web Bluetooth API (i.e. Desktop Chrome) and <em>Allow</em> Bluetooth permission.
+      You should begin to see the table being populated with near-by devices which are emitting Exposure Notifications.
+    </p>
+
+    <hr />
+
+    <div id="js-scanner"></div>
+
+    <details>
+      <summary>View source</summary>
+      <pre id="js-view-source"></pre>
+    </details>
+
+    <hr />
+
+    <h3>How it works</h3>
+    <p>
+      The <a href="https://en.wikipedia.org/wiki/Exposure_Notification" target="_blank">Exposure Notification system</a> designed by Apple and Google uses the GATT Bluetooth LE protocol to emit advertisements using the registered service UUID <code>0xfd6f</code>.
+      These advertisements are sent using the format outlined in the <a href="https://covid19-static.cdn-apple.com/applications/covid19/current/static/contact-tracing/pdf/ExposureNotification-BluetoothSpecificationv1.2.pdf" target="_blank">Exposure Notification Bluetooth Specification</a>.
+    </p>
+    <p>
+      Using the <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Bluetooth_API" target="_blank"></a>Web Bluetooth API</a> we are able to scan for devices which are emitting these kinds of service advertisement.
+      We are then able to parse the payloads service data to retrieve the current <em>Rolling Proximity Identifier</em> and <em>Encrypted Metadata</em> for that device.
+      You will notice that every 10 minutes or so both the device UUID and Rolling Proximity Identifier change, this is for privacy concerns and in-line with the <a href="https://covid19-static.cdn-apple.com/applications/covid19/current/static/contact-tracing/pdf/ExposureNotification-CryptographySpecificationv1.2.pdf" target="_blank">Exposure Notification Cryptography Specification</a>.
+    </p>
+    <p>
+      The Encrypted Metadata includes the transmitted power (txPower) value which the Bluetooth device is currently emitting at.
+      Upon a positive diagnosis the last 14 days <em>Temporary Exposure Key's</em> are sent to the <em>Diagnosis Server</em>.
+      Every interested device can then download these keys and verify if they are aware of any derived Rolling Proximity Identifier.
+      If there is a match, then the associated payloads Encrypted Metadata can then be decrypted using the days' Temporary Exposure Key.
+      This leads to a more accurate distance value being calculated based on the <em>Received Signal Strength Indicator</em> (RSSI) and transmitted power.
+    </p>
+
+    <script type="text/babel" id="js-source">
+const toHex = buffer =>
+  Array.prototype.map.call(
+    new Uint8Array(buffer), x => ("00" + x.toString(16)).slice(-2)).join("");
+
+function ContactTracingScanner({ serviceUuid = 0xfd6f, deviceOldAfterSeconds = 10 }) {
+  const [activeScan, setActiveScan] = React.useState(undefined);
+  const [devices, setDevices] = React.useState({});
+
+  React.useEffect(() => {
+    if (!activeScan) return;
+
+    const onAdvertisementReceived = event => {
+      const serviceData = event.serviceData.get(event.uuids[0]).buffer;
+
+      setDevices(devices => ({
+        ...devices,
+        [event.device.id]: {
+          uuid: event.device.id,
+          rollingProximityId: toHex(serviceData.slice(0, 16)),
+          metadata: toHex(serviceData.slice(16)),
+          rssi: event.rssi,
+          lastSeen: Date.now(),
+        },
+      }));
+    };
+
+    navigator.bluetooth.addEventListener("advertisementreceived", onAdvertisementReceived);
+
+    const removeOldDevices = setInterval(() => {
+      setDevices(devices =>
+        Object.values(devices).reduce(
+          (active, device) =>
+            Date.now() - device.lastSeen < deviceOldAfterSeconds * 1000
+              ? { ...active, [device.uuid]: device }
+              : active,
+          {}
+        )
+      );
+    }, 1000);
+
+    return () => {
+      navigator.bluetooth.removeEventListener("advertisementreceived", onAdvertisementReceived);
+      clearInterval(removeOldDevices);
+    };
+  }, [activeScan]);
+
+  const startStopScan = async event => {
+    if (activeScan) {
+      activeScan.stop();
+      setActiveScan(undefined);
+      setDevices({});
+      return;
+    }
+
+    setActiveScan(
+      await navigator.bluetooth.requestLEScan({
+        filters: [{ services: [serviceUuid] }],
+        keepRepeatedDevices: true,
+      })
+    );
+  };
+
+  return (
+    <div>
+      <button onClick={startStopScan}>{activeScan ? "Stop" : "Start"} Scan</button>
+      <table>
+        <thead>
+          <tr>
+            <th>UUID</th>
+            <th>Rolling Proximity Identifier</th>
+            <th>Metadata</th>
+            <th>RSSI</th>
+            <th>Last seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          {Object.values(devices).map(device => (
+            <tr key={device.uuid}>
+              <td>{device.uuid}</td>
+              <td>{device.rollingProximityId}</td>
+              <td>{device.metadata}</td>
+              <td>{device.rssi}</td>
+              <td>{new Date(device.lastSeen).toLocaleTimeString()}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+ReactDOM.render(<ContactTracingScanner />, document.getElementById("js-scanner"));
+    </script>
+
+    <script>
+      document.getElementById("js-view-source").innerText = document.getElementById("js-source").innerHTML.trim();
+      hljs.highlightBlock(document.getElementById("js-view-source"));
+    </script>
+  </body>
+</html>
